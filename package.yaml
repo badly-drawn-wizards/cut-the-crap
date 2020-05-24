@@ -67,6 +67,7 @@ dependencies:
 - temporary
 - regex-tdfa
 - system-filepath
+- heavy-log-shortcuts
 
 library:
   source-dirs: src

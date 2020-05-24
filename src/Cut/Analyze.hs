@@ -1,34 +1,31 @@
+{-# LANGUAGE DataKinds, KindSignatures #-}
 module Cut.Analyze
   ( detect
   , Interval(..)
   , Sound
   , Silent
-  , getStart
-  , getEnd
-  , getDuration
-  , takeOnlyLines
   )
 where
 
 import           Control.Lens
-import           Control.Monad
 import           Control.Monad.Catch
 import           Control.Monad.IO.Unlift
 import           Cut.Ffmpeg
 import           Cut.Options
 import           Data.Foldable
 import           Data.Maybe
+import           Data.List                      ( partition )
 import           Data.Text                      ( Text )
 import qualified Data.Text                     as Text
 import qualified Data.Text.IO                  as Text
 import           Data.Text.Lens
 import           Shelly                  hiding ( find )
 import           Text.Regex.TDFA         hiding ( empty )
+import qualified System.Log.Heavy.Short        as Log
 
-data Silent
-data Sound
+data IntervalType = Silent | Sound
 
-data Interval e = Interval
+data Interval (t :: IntervalType) = Interval
   { interval_start       :: Double
   , interval_end         :: Double
   , interval_duration    :: Double
@@ -38,35 +35,22 @@ data Interval e = Interval
 
 detect :: (MonadMask m, MonadUnliftIO m) => Options -> m [Interval Sound]
 detect opts = do
-  lines'' <- shelly $ detectShell opts
-  let linesRes = do
-        line <- lines''
-        if takeOnlyLines line then pure $ Right line else pure $ Left line
-      lines' = linesRes ^.. traversed . _Right
-
-  liftIO $ putStrLn "-----------------------------------------"
-  liftIO $ putStrLn "-----------------actual lines-----------------"
-  liftIO $ putStrLn "-----------------------------------------"
-  liftIO $ Text.putStrLn $ Text.unlines lines'
-  liftIO $ putStrLn "-----------------------------------------"
-  liftIO $ putStrLn "-----------------filtered lines-----------------"
-  liftIO $ putStrLn "-----------------------------------------"
-  liftIO $ Text.putStrLn $ Text.unlines (linesRes ^.. traversed . _Left)
-
-  let linedUp        = zipped lines'
-      parsed         = parse <$> linedUp
-      fancyResult    = detectSound opts parsed
+  actualLines <- shelly $ detectShell opts
+  let (silentLines, noisyLines) = partition isLineSilent actualLines
+      chunkedLines              = chunkPair noisyLines
+      intervals                 = parseInterval <$> chunkedLines
+      logMessage = Text.unlines 
+        [ "Actual lines:"
+        , Text.unlines actualLines
+        , "Silent lines:"
+        , Text.unlines silentLines
+        , "Lined up:"
+        , Text.unlines $ chunkedLines ^.. mapped . to show . packed
+        , "Intervals:"
+        , Text.unlines $ intervals ^.. mapped . to show . packed
+        ]
+      fancyResult    = detectSound opts intervals
       negativeResult = find ((0 >) . interval_duration) fancyResult
-
-  liftIO $ putStrLn "-----------------------------------------"
-  liftIO $ putStrLn "-----------------lined up-----------------"
-  liftIO $ putStrLn "-----------------------------------------"
-  liftIO $ traverse_ print linedUp
-
-  liftIO $ putStrLn "-----------------------------------------"
-  liftIO $ putStrLn "-----------------parsed-----------------"
-  liftIO $ putStrLn "-----------------------------------------"
-  liftIO $ traverse_ print parsed
 
   if isJust negativeResult
     then do
@@ -75,18 +59,12 @@ detect opts = do
       error "Found negative durations"
     else pure fancyResult
 
-takeOnlyLines :: Text -> Bool
-takeOnlyLines matchWith = matches
- where
-  silenceRegex :: String
-  silenceRegex = ".*silencedetect.*"
-  matches :: Bool
-  matches = Text.unpack matchWith =~ silenceRegex
+isLineSilent :: Text -> Bool
+isLineSilent text = text ^. unpacked =~ ".*silencedetect.*"
 
-zipped :: [Text] -> [(Text, Text)]
-zipped []                 = mempty
-zipped [_               ] = []
-zipped (one : two : rem') = (one, two) : zipped rem'
+chunkPair :: [a] -> [(a, a)]
+chunkPair (x : y : zs) = (x, y) : chunkPair zs
+chunkPair _            = []
 
 detectSound :: Options -> [Interval Silent] -> [Interval Sound]
 detectSound opts =
@@ -133,16 +111,11 @@ detectShell opt' = ffmpeg
   , "-"
   ]
 
-parse :: (Text, Text) -> Interval Silent
-parse xx = Interval { interval_start       = getStart $ fst xx
-                    , interval_end         = getEnd $ snd xx
-                    , interval_duration    = getDuration $ snd xx
-                    , interval_input_start = fst xx
-                    , interval_input_end   = snd xx
-                    }
+parseInterval :: (Text, Text) -> Maybe (Interval Silent)
+parseInterval (l1, l2) = Interval <$> getStart l1 <*> getEnd l2 <*> getDuration l2 <*> pure l2 <*> pure l2
 
-getStart :: Text -> Double
-getStart line = read $ takeWhile (/= '\'') $ matches ^. _3
+getStart :: Text -> Maybe Double
+getStart line = readMaybe $ takeWhile (/= '\'') $ matches ^. _3
  where
   str = Text.unpack line
   matches :: (String, String, String)
@@ -154,8 +127,8 @@ startMatch = "(.*)?: "
 pipe :: String
 pipe = " \\| "
 
-getDuration :: Text -> Double
-getDuration line = read $ takeWhile (/= '\'') $ match2 ^. _1
+getDuration :: Text -> Maybe Double
+getDuration line = readMaybe =<< takeWhile (/= '\'') $ match2 ^. _1
  where
   str = Text.unpack line
   match1 :: (String, String, String)
@@ -164,7 +137,7 @@ getDuration line = read $ takeWhile (/= '\'') $ match2 ^. _1
   match2 = (match1 ^. _3) =~ pipe
 
 getEnd :: Text -> Double
-getEnd line = read $ match2 ^. _3
+getEnd line = readMaybe =<< match2 ^. _3
  where
   str = Text.unpack line
   match1 :: (String, String, String)
